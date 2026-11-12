@@ -1641,7 +1641,6 @@ const TG_CLOUD_KEY = 'mrfeast_save_v1_9';
 
 if (tg) {
     tg.expand();
-    tg.enableClosingConfirmation();
     if (tg.initDataUnsafe?.user) {
         tgUser = tg.initDataUnsafe.user;
         tgUserId = tgUser.id;
@@ -2600,8 +2599,17 @@ window.addEventListener('beforeunload', () => {
     saveGameToCloud(true);
 });
 
-// Тик 500мс сохраняет только при изменениях (см. lastSavedJson)
-setInterval(() => { saveGameToCloud(); }, 500);
+// Тик 500мс: сохраняет только при изменениях.
+// Подтверждение закрытия Telegram включено только пока есть несохраненные изменения.
+setInterval(() => {
+    let dirty = true;
+    try { dirty = JSON.stringify(getSaveDataObject()) !== lastSavedJson; } catch (e) {}
+    if (tg) {
+        if (dirty && typeof tg.enableClosingConfirmation === 'function') tg.enableClosingConfirmation();
+        else if (!dirty && typeof tg.disableClosingConfirmation === 'function') tg.disableClosingConfirmation();
+    }
+    saveGameToCloud();
+}, 500);
 
 console.log('🎮 MrFeast Clicker v1.9.0-QOS Ready!');
 console.log('🖥 QuadroOS FastFPS Integration: Active');

@@ -1938,67 +1938,92 @@ function applySaveData(user) {
     updateDisplay();
 }
 
-// ПОПРАВКА: Надежная функция сохранения с проверкой среды и защитой от гонок
-async function saveGameToCloud() {
-    if (isSaving) return; // Не создаем очередь запросов
+// =============================================
+// STORAGE ROUTING
+// QuadroOS -> (если есть) ; Telegram Mini App доступен -> TG CloudStorage ; иначе -> LocalStorage
+// =============================================
+const LS_FALLBACK_KEY = 'mrfeast_clicker_fallback';
+const TG_CALL_TIMEOUT_MS = 4000;   // TG callbacks могут не прийти вне Telegram - не даем зависнуть
+const TG_MAX_VALUE_LEN = 4096;     // лимит значения в Telegram CloudStorage
+let lastSavedJson = null;          // оптимизация: пишем только если данные изменились
+let saveQueued = false;            // оптимизация: одно отложенное сохранение вместо очереди
+let gameLoaded = false;            // не даем сохранять дефолтное состояние до загрузки (защита от перезаписи)
+
+function isTelegramMiniAppAvailable() {
+    try {
+        if (!tg || !tg.CloudStorage || typeof tg.CloudStorage.setItem !== 'function') return false;
+        if (typeof tg.isVersionAtLeast === 'function' && !tg.isVersionAtLeast('6.9')) return false;
+        return !!(tg.initData || (tg.platform && tg.platform !== 'unknown'));
+    } catch (e) { return false; }
+}
+
+// Обертка над callback-API Telegram: промис с таймаутом
+function tgCall(fn) {
+    return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('TG CloudStorage timeout')), TG_CALL_TIMEOUT_MS);
+        try {
+            fn((err, res) => { clearTimeout(timer); if (err) reject(err); else resolve(res); });
+        } catch (e) { clearTimeout(timer); reject(e); }
+    });
+}
+
+// Сохранение: QuadroOS API -> Telegram CloudStorage (если доступен) -> LocalStorage
+async function saveGameToCloud(force = false) {
+    if (!gameLoaded && !force) return;
     const data = getSaveDataObject();
+    const json = JSON.stringify(data);
+    if (!force && json === lastSavedJson) return;   // ничего не изменилось - не пишем
+    if (isSaving) { saveQueued = true; return; }    // уже идет запись - ставим одну в очередь
     isSaving = true;
 
     try {
-        // Приоритет 1: Проверяем наличие API QuadroOS напрямую
         if (window.QOSAppStorage && typeof window.QOSAppStorage.save === 'function') {
             await window.QOSAppStorage.save(QOS_STORAGE_KEY, data);
-        } 
-        // Приоритет 2: Telegram Cloud Storage
-        else if (tg?.CloudStorage) {
-            await new Promise((resolve, reject) => {
-                tg.CloudStorage.setItem(TG_CLOUD_KEY, JSON.stringify(data), (err) => {
-                    if (err) reject(err);
-                    else resolve();
-                });
-            });
+        } else if (isTelegramMiniAppAvailable() && json.length <= TG_MAX_VALUE_LEN) {
+            await tgCall(cb => tg.CloudStorage.setItem(TG_CLOUD_KEY, json, cb));
+        } else {
+            localStorage.setItem(LS_FALLBACK_KEY, json);
         }
-        // Fallback: LocalStorage
-        else {
-            localStorage.setItem('mrfeast_clicker_fallback', JSON.stringify(data));
-        }
+        lastSavedJson = json;
     } catch (e) {
         console.error('💔 Save error:', e);
+        // аварийная копия в LocalStorage; при следующем тике попробуем основной способ снова
+        try { localStorage.setItem(LS_FALLBACK_KEY, json); } catch (_) {}
     } finally {
         isSaving = false;
+        if (saveQueued) { saveQueued = false; saveGameToCloud(); }
     }
 }
 
-// ПОПРАВКА: Надежная загрузка с последовательным перебором источников
+// Загрузка: QuadroOS -> Telegram CloudStorage (если доступен) -> LocalStorage
 async function loadGameFromCloud() {
     let loaded = false;
     try {
-        // Пытаемся загрузить из QuadroOS
         if (window.QOSAppStorage && typeof window.QOSAppStorage.load === 'function') {
             const qosData = await window.QOSAppStorage.load(QOS_STORAGE_KEY);
             if (qosData) {
                 applySaveData(qosData);
                 loaded = true;
-                isQuadroOS = true; 
+                isQuadroOS = true;
                 showNotif('✅ Данные загружены из QuadroOS');
             }
         }
-        
-        // Если не вышло, пробуем Telegram Cloud
-        if (!loaded && tg?.CloudStorage) {
-            const val = await new Promise((resolve) => {
-                tg.CloudStorage.getItem(TG_CLOUD_KEY, (err, res) => resolve(res));
-            });
-            if (val) {
-                applySaveData(JSON.parse(val));
-                loaded = true;
-                showNotif('✅ Данные загружены из TG Cloud');
+
+        if (!loaded && isTelegramMiniAppAvailable()) {
+            try {
+                const val = await tgCall(cb => tg.CloudStorage.getItem(TG_CLOUD_KEY, cb));
+                if (val) {
+                    applySaveData(JSON.parse(val));
+                    loaded = true;
+                    showNotif('✅ Данные загружены из TG Cloud');
+                }
+            } catch (e) {
+                console.warn('TG CloudStorage load failed, using LocalStorage:', e);
             }
         }
 
-        // Последний шанс: LocalStorage
         if (!loaded) {
-            const local = localStorage.getItem('mrfeast_clicker_fallback');
+            const local = localStorage.getItem(LS_FALLBACK_KEY);
             if (local) {
                 applySaveData(JSON.parse(local));
                 loaded = true;
@@ -2006,6 +2031,9 @@ async function loadGameFromCloud() {
         }
     } catch (e) {
         console.error('Load error:', e);
+    } finally {
+        gameLoaded = true;
+        lastSavedJson = null; // первое сохранение после загрузки пройдет всегда
     }
 
     if (!loaded) {
@@ -2565,17 +2593,19 @@ window.addEventListener('beforeunload', () => {
     if (circlesInterval) clearInterval(circlesInterval);
     if (serverTaxInterval) clearInterval(serverTaxInterval);
     if (fpsAnimationId) cancelAnimationFrame(fpsAnimationId);
-    // Синхронная страховка в LocalStorage
-    try { localStorage.setItem('mrfeast_clicker_fallback', JSON.stringify(getSaveDataObject())); } catch(e){}
-    // Асинхронный вызов облака
-    saveGameToCloud();
+    if (!gameLoaded) return;
+    // Синхронная страховка в LocalStorage (всегда, даже если основной способ - Telegram)
+    try { localStorage.setItem(LS_FALLBACK_KEY, JSON.stringify(getSaveDataObject())); } catch(e){}
+    // Асинхронный вызов основного хранилища
+    saveGameToCloud(true);
 });
 
+// Тик 500мс сохраняет только при изменениях (см. lastSavedJson)
 setInterval(() => { saveGameToCloud(); }, 500);
 
 console.log('🎮 MrFeast Clicker v1.9.0-QOS Ready!');
 console.log('🖥 QuadroOS FastFPS Integration: Active');
-console.log('💾 Dual Storage System: Active');
+console.log('💾 Storage: ' + (isTelegramMiniAppAvailable() ? 'Telegram CloudStorage' : 'LocalStorage') + ' (changes-only saves)');
 </script>
 </body>
 </html>
